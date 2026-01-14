@@ -20,6 +20,10 @@
   ;; calls that ought to be recorded.
   true)
 
+(def ^:dynamic *redefs*
+  "Thread-local var re-definitions."
+  {})
+
 (defn ^:private validate-specs
   [alleged-specs]
   (when-not (and (coll? alleged-specs)
@@ -69,21 +73,41 @@
        (finally
          (swap! states dissoc o#)))))
 
+(defn call-redef
+  "Return a function that will pass execution to the matching one in *redefs* if it
+  exists, otherwise pass execution to the original value."
+  [orig-value var]
+  (fn [& args]
+    (let [redef (get *redefs* var)]
+      (apply (or redef orig-value) args))))
+
+(defn redef-spec-vars!
+  "Redefine all of the vars in a spec, if they haven't been redefined yet, to respect
+  the current *redefs* binding."
+  [specs]
+  (doseq [{:keys [var]} specs]
+    (locking var
+      (when-not (-> var meta ::redeffed?)
+        (alter-meta! var #(assoc % :redeffed? true))
+        (alter-var-root var call-redef var)))))
+
 ;; TODO: add the ability to configure whether out-of-order
 ;; calls are allowed, or repeat calls, or such and such.
 (defn record
   "Redefs the vars to record the calls, and returns [val cassette]
    where val is the return value of func."
   [specs func]
+  (redef-spec-vars! specs)
   (let [recorded-at (java.util.Date.)
         calls (atom [])
         record! #(swap! calls conj %)
         redeffings (->> specs
                         (map (juxt :var (partial build-wrapped-fn record!)))
                         (into {}))
-        func-return (binding [*recording?* true]
+        func-return (binding [*recording?* true
+                              *redefs* redeffings]
                       (with-state :recording
-                        (with-redefs-fn redeffings func)))
+                        (func)))
         cassette {:calls @calls :recorded-at recorded-at}]
     [func-return cassette]))
 
@@ -120,6 +144,7 @@
 ;; particular, not necessarily all the vars considered together.
 (defn playback
   [specs cassette func]
+  (redef-spec-vars! specs)
   (let [the-playbacker (playbacker cassette :key)
         redeffings
         (into {}
@@ -137,8 +162,9 @@
                                           (:return (the-playbacker the-var-name k)))
                                         (apply orig args*))))]]
                 [var (add-meta-from wrapped orig)]))]
-    (with-state :replaying
-      (with-redefs-fn redeffings func))))
+    (binding [*redefs* redeffings]
+      (with-state :replaying
+        (func)))))
 
 (def ^:dynamic *verbose?* false)
 (defn println'
